@@ -2,6 +2,7 @@
   "domain": "iammeter",
   "name": "Iammeter",
   "config_flow": true,
+   "version": "0.0.1",
   "documentation": "https://www.home-assistant.io/integrations/iammeter",
   "codeowners": ["@lewei50"],
   "requirements": ["iammeter==0.2.1"],
