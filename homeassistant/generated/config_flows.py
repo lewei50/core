@@ -161,6 +161,7 @@ FLOWS = {
         "hvv_departures",
         "hyperion",
         "ialarm",
+        "iammeter",
         "ialarm_xr",
         "iaqualink",
         "icloud",
