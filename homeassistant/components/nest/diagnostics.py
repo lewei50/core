@@ -27,16 +27,21 @@ def _async_get_nest_devices(
     if DATA_SDM not in config_entry.data:
         return {}
 
-    if DATA_DEVICE_MANAGER not in hass.data[DOMAIN]:
+    if (
+        config_entry.entry_id not in hass.data[DOMAIN]
+        or DATA_DEVICE_MANAGER not in hass.data[DOMAIN][config_entry.entry_id]
+    ):
         return {}
 
-    device_manager: DeviceManager = hass.data[DOMAIN][DATA_DEVICE_MANAGER]
+    device_manager: DeviceManager = hass.data[DOMAIN][config_entry.entry_id][
+        DATA_DEVICE_MANAGER
+    ]
     return device_manager.devices
 
 
 async def async_get_config_entry_diagnostics(
     hass: HomeAssistant, config_entry: ConfigEntry
-) -> dict:
+) -> dict[str, Any]:
     """Return diagnostics for a config entry."""
     nest_devices = _async_get_nest_devices(hass, config_entry)
     if not nest_devices:
@@ -59,7 +64,7 @@ async def async_get_device_diagnostics(
     hass: HomeAssistant,
     config_entry: ConfigEntry,
     device: DeviceEntry,
-) -> dict:
+) -> dict[str, Any]:
     """Return diagnostics for a device."""
     nest_devices = _async_get_nest_devices(hass, config_entry)
     nest_device_id = next(iter(device.identifiers))[1]

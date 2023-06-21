@@ -6,21 +6,23 @@ import logging
 
 from bimmer_connected.account import MyBMWAccount
 from bimmer_connected.api.regions import get_region_from_name
-from bimmer_connected.models import GPSPosition
-from httpx import HTTPError, TimeoutException
+from bimmer_connected.models import GPSPosition, MyBMWAPIError, MyBMWAuthError
+from httpx import RequestError
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_PASSWORD, CONF_REGION, CONF_USERNAME
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
-from .const import CONF_READ_ONLY, CONF_REFRESH_TOKEN, DOMAIN
+from .const import CONF_GCID, CONF_READ_ONLY, CONF_REFRESH_TOKEN, DOMAIN
 
-SCAN_INTERVAL = timedelta(seconds=300)
+DEFAULT_SCAN_INTERVAL_SECONDS = 300
+SCAN_INTERVAL = timedelta(seconds=DEFAULT_SCAN_INTERVAL_SECONDS)
 _LOGGER = logging.getLogger(__name__)
 
 
-class BMWDataUpdateCoordinator(DataUpdateCoordinator):
+class BMWDataUpdateCoordinator(DataUpdateCoordinator[None]):
     """Class to manage fetching BMW data."""
 
     account: MyBMWAccount
@@ -32,13 +34,17 @@ class BMWDataUpdateCoordinator(DataUpdateCoordinator):
             entry.data[CONF_PASSWORD],
             get_region_from_name(entry.data[CONF_REGION]),
             observer_position=GPSPosition(hass.config.latitude, hass.config.longitude),
-            use_metric_units=hass.config.units.is_metric,
+            # Force metric system as BMW API apparently only returns metric values now
+            use_metric_units=True,
         )
         self.read_only = entry.options[CONF_READ_ONLY]
         self._entry = entry
 
         if CONF_REFRESH_TOKEN in entry.data:
-            self.account.set_refresh_token(entry.data[CONF_REFRESH_TOKEN])
+            self.account.set_refresh_token(
+                refresh_token=entry.data[CONF_REFRESH_TOKEN],
+                gcid=entry.data.get(CONF_GCID),
+            )
 
         super().__init__(
             hass,
@@ -53,9 +59,12 @@ class BMWDataUpdateCoordinator(DataUpdateCoordinator):
 
         try:
             await self.account.get_vehicles()
-        except (HTTPError, TimeoutException) as err:
+        except MyBMWAuthError as err:
+            # Clear refresh token and trigger reauth
             self._update_config_entry_refresh_token(None)
-            raise UpdateFailed(f"Error communicating with BMW API: {err}") from err
+            raise ConfigEntryAuthFailed(err) from err
+        except (MyBMWAPIError, RequestError) as err:
+            raise UpdateFailed(err) from err
 
         if self.account.refresh_token != old_refresh_token:
             self._update_config_entry_refresh_token(self.account.refresh_token)

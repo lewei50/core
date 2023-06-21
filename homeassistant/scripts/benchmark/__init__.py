@@ -12,14 +12,13 @@ from timeit import default_timer as timer
 from typing import TypeVar
 
 from homeassistant import core
-from homeassistant.components.websocket_api.const import JSON_DUMP
 from homeassistant.const import EVENT_STATE_CHANGED
 from homeassistant.helpers.entityfilter import convert_include_exclude_filter
 from homeassistant.helpers.event import (
     async_track_state_change,
     async_track_state_change_event,
 )
-from homeassistant.helpers.json import JSONEncoder
+from homeassistant.helpers.json import JSON_DUMP, JSONEncoder
 
 # mypy: allow-untyped-calls, allow-untyped-defs, no-check-untyped-defs
 # mypy: no-warn-return-any
@@ -34,7 +33,7 @@ def run(args):
     # Disable logging
     logging.getLogger("homeassistant.core").setLevel(logging.CRITICAL)
 
-    parser = argparse.ArgumentParser(description=("Run a Home Assistant benchmark."))
+    parser = argparse.ArgumentParser(description="Run a Home Assistant benchmark.")
     parser.add_argument("name", choices=BENCHMARKS)
     parser.add_argument("--script", choices=["benchmark"])
 
@@ -192,7 +191,10 @@ async def state_changed_event_helper(hass):
 
 @benchmark
 async def state_changed_event_filter_helper(hass):
-    """Run a million events through state changed event helper with 1000 entities that all get filtered."""
+    """Run a million events through state changed event helper.
+
+    With 1000 entities that all get filtered.
+    """
     count = 0
     entity_id = "light.kitchen"
     events_to_fire = 10**6
@@ -351,7 +353,7 @@ def _create_state_changed_event_from_old_new(
     row.old_state_id = old_state and 1
     row.state_id = new_state and 1
 
-    # pylint: disable=import-outside-toplevel
+    # pylint: disable-next=import-outside-toplevel
     from homeassistant.components import logbook
 
     return logbook.LazyEventPartialState(row, {})

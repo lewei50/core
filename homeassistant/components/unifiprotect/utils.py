@@ -4,31 +4,53 @@ from __future__ import annotations
 from collections.abc import Generator, Iterable
 import contextlib
 from enum import Enum
+from pathlib import Path
 import socket
 from typing import Any
 
+from aiohttp import CookieJar
 from pyunifiprotect import ProtectApiClient
-from pyunifiprotect.data.base import ProtectAdoptableDeviceModel, ProtectDeviceModel
+from pyunifiprotect.data import (
+    Bootstrap,
+    Light,
+    LightModeEnableType,
+    LightModeType,
+    ProtectAdoptableDeviceModel,
+)
 
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import (
+    CONF_HOST,
+    CONF_PASSWORD,
+    CONF_PORT,
+    CONF_USERNAME,
+    CONF_VERIFY_SSL,
+)
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers.aiohttp_client import async_create_clientsession
+from homeassistant.helpers.storage import STORAGE_DIR
 
-from .const import ModelType
+from .const import (
+    CONF_ALL_UPDATES,
+    CONF_OVERRIDE_CHOST,
+    DEVICES_FOR_SUBSCRIBE,
+    DOMAIN,
+    ModelType,
+)
 
 
 def get_nested_attr(obj: Any, attr: str) -> Any:
     """Fetch a nested attribute."""
-    attrs = attr.split(".")
+    if "." not in attr:
+        value = getattr(obj, attr, None)
+    else:
+        value = obj
+        for key in attr.split("."):
+            if not hasattr(value, key):
+                return None
+            value = getattr(value, key)
 
-    value = obj
-    for key in attrs:
-        if not hasattr(value, key):
-            return None
-        value = getattr(value, key)
-
-    if isinstance(value, Enum):
-        value = value.value
-
-    return value
+    return value.value if isinstance(value, Enum) else value
 
 
 @callback
@@ -59,33 +81,66 @@ async def _async_resolve(hass: HomeAssistant, host: str) -> str | None:
     return None
 
 
+@callback
 def async_get_devices_by_type(
-    api: ProtectApiClient, device_type: ModelType
-) -> dict[str, ProtectDeviceModel]:
-    """Get devices by type."""
-    devices: dict[str, ProtectDeviceModel] = getattr(
-        api.bootstrap, f"{device_type.value}s"
-    )
-    return devices
-
-
-def async_get_adoptable_devices_by_type(
-    api: ProtectApiClient, device_type: ModelType
+    bootstrap: Bootstrap, device_type: ModelType
 ) -> dict[str, ProtectAdoptableDeviceModel]:
-    """Get adoptable devices by type."""
+    """Get devices by type."""
+
     devices: dict[str, ProtectAdoptableDeviceModel] = getattr(
-        api.bootstrap, f"{device_type.value}s"
+        bootstrap, f"{device_type.value}s"
     )
     return devices
 
 
 @callback
 def async_get_devices(
-    api: ProtectApiClient, model_type: Iterable[ModelType]
-) -> Generator[ProtectDeviceModel, None, None]:
+    bootstrap: Bootstrap, model_type: Iterable[ModelType]
+) -> Generator[ProtectAdoptableDeviceModel, None, None]:
     """Return all device by type."""
     return (
         device
         for device_type in model_type
-        for device in async_get_devices_by_type(api, device_type).values()
+        for device in async_get_devices_by_type(bootstrap, device_type).values()
+    )
+
+
+@callback
+def async_get_light_motion_current(obj: Light) -> str:
+    """Get light motion mode for Flood Light."""
+
+    if (
+        obj.light_mode_settings.mode == LightModeType.MOTION
+        and obj.light_mode_settings.enable_at == LightModeEnableType.DARK
+    ):
+        return f"{LightModeType.MOTION.value}Dark"
+    return obj.light_mode_settings.mode.value
+
+
+@callback
+def async_dispatch_id(entry: ConfigEntry, dispatch: str) -> str:
+    """Generate entry specific dispatch ID."""
+
+    return f"{DOMAIN}.{entry.entry_id}.{dispatch}"
+
+
+@callback
+def async_create_api_client(
+    hass: HomeAssistant, entry: ConfigEntry
+) -> ProtectApiClient:
+    """Create ProtectApiClient from config entry."""
+
+    session = async_create_clientsession(hass, cookie_jar=CookieJar(unsafe=True))
+    return ProtectApiClient(
+        host=entry.data[CONF_HOST],
+        port=entry.data[CONF_PORT],
+        username=entry.data[CONF_USERNAME],
+        password=entry.data[CONF_PASSWORD],
+        verify_ssl=entry.data[CONF_VERIFY_SSL],
+        session=session,
+        subscribed_models=DEVICES_FOR_SUBSCRIBE,
+        override_connection_host=entry.options.get(CONF_OVERRIDE_CHOST, False),
+        ignore_stats=not entry.options.get(CONF_ALL_UPDATES, False),
+        ignore_unadopted=False,
+        cache_dir=Path(hass.config.path(STORAGE_DIR, "unifiprotect_cache")),
     )

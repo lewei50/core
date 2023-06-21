@@ -61,9 +61,9 @@ def create_pywemo_device(pywemo_registry, pywemo_model):
     device.host = MOCK_HOST
     device.port = MOCK_PORT
     device.name = MOCK_NAME
-    device.serialnumber = MOCK_SERIAL_NUMBER
+    device.serial_number = MOCK_SERIAL_NUMBER
     device.model_name = pywemo_model.replace("LongPress", "")
-    device.udn = f"uuid:{device.model_name}-1_0-{device.serialnumber}"
+    device.udn = f"uuid:{device.model_name}-1_0-{device.serial_number}"
     device.firmware_version = MOCK_FIRMWARE_VERSION
     device.get_state.return_value = 0  # Default to Off
     device.supports_long_press.return_value = cls.supports_long_press()
@@ -95,6 +95,15 @@ def pywemo_device_fixture(pywemo_registry, pywemo_model):
     """Fixture for WeMoDevice instances."""
     with create_pywemo_device(pywemo_registry, pywemo_model) as pywemo_device:
         yield pywemo_device
+
+
+@pytest.fixture(name="pywemo_dli_device")
+def pywemo_dli_device_fixture(pywemo_registry, pywemo_model):
+    """Fixture for Digital Loggers emulated instances."""
+    with create_pywemo_device(pywemo_registry, pywemo_model) as pywemo_dli_device:
+        pywemo_dli_device.model_name = "DLI emulated Belkin Socket"
+        pywemo_dli_device.serial_number = "1234567891"
+        yield pywemo_dli_device
 
 
 @pytest.fixture(name="wemo_entity_suffix")
@@ -129,3 +138,9 @@ async def async_create_wemo_entity(hass, pywemo_device, wemo_entity_suffix):
 async def async_wemo_entity_fixture(hass, pywemo_device, wemo_entity_suffix):
     """Fixture for a Wemo entity in hass."""
     return await async_create_wemo_entity(hass, pywemo_device, wemo_entity_suffix)
+
+
+@pytest.fixture(name="wemo_dli_entity")
+async def async_wemo_dli_entity_fixture(hass, pywemo_dli_device, wemo_entity_suffix):
+    """Fixture for a Wemo entity in hass."""
+    return await async_create_wemo_entity(hass, pywemo_dli_device, wemo_entity_suffix)

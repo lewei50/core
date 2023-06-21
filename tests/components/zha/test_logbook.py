@@ -1,11 +1,13 @@
 """ZHA logbook describe events tests."""
+from unittest.mock import patch
 
 import pytest
 import zigpy.profiles.zha
 import zigpy.zcl.clusters.general as general
 
 from homeassistant.components.zha.core.const import ZHA_EVENT
-from homeassistant.const import CONF_DEVICE_ID, CONF_UNIQUE_ID
+from homeassistant.const import CONF_DEVICE_ID, CONF_UNIQUE_ID, Platform
+from homeassistant.core import HomeAssistant
 from homeassistant.helpers import device_registry as dr
 from homeassistant.setup import async_setup_component
 
@@ -29,6 +31,13 @@ UP = "up"
 DOWN = "down"
 
 
+@pytest.fixture(autouse=True)
+def sensor_platform_only():
+    """Only set up the sensor and required base platforms to speed up tests."""
+    with patch("homeassistant.components.zha.PLATFORMS", (Platform.SENSOR,)):
+        yield
+
+
 @pytest.fixture
 async def mock_devices(hass, zigpy_device_mock, zha_device_joined):
     """IAS device fixture."""
@@ -50,8 +59,10 @@ async def mock_devices(hass, zigpy_device_mock, zha_device_joined):
     return zigpy_device, zha_device
 
 
-async def test_zha_logbook_event_device_with_triggers(hass, mock_devices):
-    """Test zha logbook events with device and triggers."""
+async def test_zha_logbook_event_device_with_triggers(
+    hass: HomeAssistant, mock_devices
+) -> None:
+    """Test ZHA logbook events with device and triggers."""
 
     zigpy_device, zha_device = mock_devices
 
@@ -129,14 +140,16 @@ async def test_zha_logbook_event_device_with_triggers(hass, mock_devices):
 
     assert events[1]["name"] == "FakeManufacturer FakeModel"
     assert events[1]["domain"] == "zha"
-    assert (
-        events[1]["message"]
-        == "Up - Remote Button Double Press event was fired with parameters: {'test': 'test'}"
+    assert events[1]["message"] == (
+        "Up - Remote Button Double Press event was fired with parameters: "
+        "{'test': 'test'}"
     )
 
 
-async def test_zha_logbook_event_device_no_triggers(hass, mock_devices):
-    """Test zha logbook events with device and without triggers."""
+async def test_zha_logbook_event_device_no_triggers(
+    hass: HomeAssistant, mock_devices
+) -> None:
+    """Test ZHA logbook events with device and without triggers."""
 
     zigpy_device, zha_device = mock_devices
     ieee_address = str(zha_device.ieee)
@@ -163,6 +176,40 @@ async def test_zha_logbook_event_device_no_triggers(hass, mock_devices):
                     },
                 },
             ),
+            MockRow(
+                ZHA_EVENT,
+                {
+                    CONF_DEVICE_ID: reg_device.id,
+                    "device_ieee": str(ieee_address),
+                    CONF_UNIQUE_ID: f"{str(ieee_address)}:1:0x0006",
+                    "endpoint_id": 1,
+                    "cluster_id": 6,
+                    "params": {
+                        "test": "test",
+                    },
+                },
+            ),
+            MockRow(
+                ZHA_EVENT,
+                {
+                    CONF_DEVICE_ID: reg_device.id,
+                    "device_ieee": str(ieee_address),
+                    CONF_UNIQUE_ID: f"{str(ieee_address)}:1:0x0006",
+                    "endpoint_id": 1,
+                    "cluster_id": 6,
+                    "params": {},
+                },
+            ),
+            MockRow(
+                ZHA_EVENT,
+                {
+                    CONF_DEVICE_ID: reg_device.id,
+                    "device_ieee": str(ieee_address),
+                    CONF_UNIQUE_ID: f"{str(ieee_address)}:1:0x0006",
+                    "endpoint_id": 1,
+                    "cluster_id": 6,
+                },
+            ),
         ],
     )
 
@@ -173,9 +220,25 @@ async def test_zha_logbook_event_device_no_triggers(hass, mock_devices):
         == "Shake event was fired with parameters: {'test': 'test'}"
     )
 
+    assert events[1]["name"] == "FakeManufacturer FakeModel"
+    assert events[1]["domain"] == "zha"
+    assert (
+        events[1]["message"] == "Zha Event was fired with parameters: {'test': 'test'}"
+    )
 
-async def test_zha_logbook_event_device_no_device(hass, mock_devices):
-    """Test zha logbook events without device and without triggers."""
+    assert events[2]["name"] == "FakeManufacturer FakeModel"
+    assert events[2]["domain"] == "zha"
+    assert events[2]["message"] == "Zha Event was fired"
+
+    assert events[3]["name"] == "FakeManufacturer FakeModel"
+    assert events[3]["domain"] == "zha"
+    assert events[3]["message"] == "Zha Event was fired"
+
+
+async def test_zha_logbook_event_device_no_device(
+    hass: HomeAssistant, mock_devices
+) -> None:
+    """Test ZHA logbook events without device and without triggers."""
 
     hass.config.components.add("recorder")
     assert await async_setup_component(hass, "logbook", {})

@@ -9,8 +9,6 @@ from aiohttp import web
 from homeassistant.core import HomeAssistant, callback
 
 from .const import (
-    ATTR_SETTINGS,
-    DOMAIN,
     EXT_X_START_LL_HLS,
     EXT_X_START_NON_LL_HLS,
     FORMAT_CONTENT_TYPE,
@@ -26,9 +24,11 @@ from .core import (
     StreamSettings,
     StreamView,
 )
-from .fmp4utils import get_codec_string
+from .fmp4utils import get_codec_string, transform_init
 
 if TYPE_CHECKING:
+    from homeassistant.components.camera import DynamicStreamSettings
+
     from . import Stream
 
 
@@ -47,16 +47,32 @@ def async_setup_hls(hass: HomeAssistant) -> str:
 class HlsStreamOutput(StreamOutput):
     """Represents HLS Output formats."""
 
-    def __init__(self, hass: HomeAssistant, idle_timer: IdleTimer) -> None:
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        idle_timer: IdleTimer,
+        stream_settings: StreamSettings,
+        dynamic_stream_settings: DynamicStreamSettings,
+    ) -> None:
         """Initialize HLS output."""
-        super().__init__(hass, idle_timer, deque_maxlen=MAX_SEGMENTS)
-        self.stream_settings: StreamSettings = hass.data[DOMAIN][ATTR_SETTINGS]
-        self._target_duration = self.stream_settings.min_segment_duration
+        super().__init__(
+            hass,
+            idle_timer,
+            stream_settings,
+            dynamic_stream_settings,
+            deque_maxlen=MAX_SEGMENTS,
+        )
+        self._target_duration = stream_settings.min_segment_duration
 
     @property
     def name(self) -> str:
         """Return provider name."""
         return HLS_PROVIDER
+
+    def cleanup(self) -> None:
+        """Handle cleanup."""
+        super().cleanup()
+        self._segments.clear()
 
     @property
     def target_duration(self) -> float:
@@ -78,14 +94,20 @@ class HlsStreamOutput(StreamOutput):
         )
 
     def discontinuity(self) -> None:
-        """Remove incomplete segment from deque."""
+        """Fix incomplete segment at end of deque."""
         self._hass.loop.call_soon_threadsafe(self._async_discontinuity)
 
     @callback
     def _async_discontinuity(self) -> None:
-        """Remove incomplete segment from deque in event loop."""
-        if self._segments and not self._segments[-1].complete:
-            self._segments.pop()
+        """Fix incomplete segment at end of deque in event loop."""
+        # Fill in the segment duration or delete the segment if empty
+        if self._segments:
+            if (last_segment := self._segments[-1]).parts:
+                last_segment.duration = sum(
+                    part.duration for part in last_segment.parts
+                )
+            else:
+                self._segments.pop()
 
 
 class HlsMasterPlaylistView(StreamView):
@@ -326,7 +348,7 @@ class HlsInitView(StreamView):
         if not (segments := track.get_segments()) or not (body := segments[0].init):
             return web.HTTPNotFound()
         return web.Response(
-            body=body,
+            body=transform_init(body, stream.dynamic_stream_settings.orientation),
             headers={"Content-Type": "video/mp4"},
         )
 

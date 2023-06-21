@@ -27,13 +27,9 @@ FIRMWARE_REVISION = "revision"
 FIRMWARE_SUB_REVISION = "subRevision"
 FIRMWARE_BUILD = "build"
 
-DEVICE_NAME = "device_name"
-DEVICE_MAC_ADDRESS = "device_mac_address"
-DEVICE_SERIAL_NUMBER = "device_serial_number"
-DEVICE_REVISION = "device_revision"
-DEVICE_INFO = "device_info"
-DEVICE_MODEL = "device_model"
-DEVICE_FIRMWARE = "device_firmware"
+REDACT_MAC_ADDRESS = "mac_address"
+REDACT_SERIAL_NUMBER = "serial_number"
+REDACT_HUB_ADDRESS = "hub_address"
 
 SCENE_NAME = "name"
 SCENE_ID = "id"
@@ -50,16 +46,10 @@ ROOM_ID = "id"
 SHADE_BATTERY_LEVEL = "batteryStrength"
 SHADE_BATTERY_LEVEL_MAX = 200
 
-STATE_ATTRIBUTE_ROOM_NAME = "roomName"
+ATTR_SIGNAL_STRENGTH = "signalStrength"
+ATTR_SIGNAL_STRENGTH_MAX = 4
 
-PV_API = "pv_api"
-PV_HUB = "pv_hub"
-PV_HUB_ADDRESS = "pv_hub_address"
-PV_SHADES = "pv_shades"
-PV_SCENE_DATA = "pv_scene_data"
-PV_SHADE_DATA = "pv_shade_data"
-PV_ROOM_DATA = "pv_room_data"
-COORDINATOR = "coordinator"
+STATE_ATTRIBUTE_ROOM_NAME = "roomName"
 
 HUB_EXCEPTIONS = (
     ServerDisconnectedError,
@@ -87,3 +77,16 @@ POS_KIND_PRIMARY = 1
 POS_KIND_SECONDARY = 2
 POS_KIND_VANE = 3
 POS_KIND_ERROR = 4
+
+
+ATTR_BATTERY_KIND = "batteryKind"
+BATTERY_KIND_HARDWIRED = 1
+BATTERY_KIND_BATTERY = 2
+BATTERY_KIND_RECHARGABLE = 3
+
+POWER_SUPPLY_TYPE_MAP = {
+    BATTERY_KIND_HARDWIRED: "Hardwired Power Supply",
+    BATTERY_KIND_BATTERY: "Battery Wand",
+    BATTERY_KIND_RECHARGABLE: "Rechargeable Battery",
+}
+POWER_SUPPLY_TYPE_REVERSE_MAP = {v: k for k, v in POWER_SUPPLY_TYPE_MAP.items()}

@@ -4,10 +4,12 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass, field
+import logging
 from typing import Any, cast
 
 from aioesphomeapi import (
     COMPONENT_TYPE_TO_INFO,
+    AlarmControlPanelInfo,
     APIClient,
     APIVersion,
     BinarySensorInfo,
@@ -24,6 +26,7 @@ from aioesphomeapi import (
     NumberInfo,
     SelectInfo,
     SensorInfo,
+    SensorState,
     SwitchInfo,
     TextSensorInfo,
     UserService,
@@ -31,28 +34,34 @@ from aioesphomeapi import (
 from aioesphomeapi.model import ButtonInfo
 
 from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.dispatcher import async_dispatcher_send
 from homeassistant.helpers.storage import Store
 
+from .dashboard import async_get_dashboard
+
+_SENTINEL = object()
 SAVE_DELAY = 120
+_LOGGER = logging.getLogger(__name__)
 
 # Mapping from ESPHome info type to HA platform
-INFO_TYPE_TO_PLATFORM: dict[type[EntityInfo], str] = {
-    BinarySensorInfo: "binary_sensor",
-    ButtonInfo: "button",
-    CameraInfo: "camera",
-    ClimateInfo: "climate",
-    CoverInfo: "cover",
-    FanInfo: "fan",
-    LightInfo: "light",
-    LockInfo: "lock",
-    MediaPlayerInfo: "media_player",
-    NumberInfo: "number",
-    SelectInfo: "select",
-    SensorInfo: "sensor",
-    SwitchInfo: "switch",
-    TextSensorInfo: "sensor",
+INFO_TYPE_TO_PLATFORM: dict[type[EntityInfo], Platform] = {
+    AlarmControlPanelInfo: Platform.ALARM_CONTROL_PANEL,
+    BinarySensorInfo: Platform.BINARY_SENSOR,
+    ButtonInfo: Platform.BUTTON,
+    CameraInfo: Platform.CAMERA,
+    ClimateInfo: Platform.CLIMATE,
+    CoverInfo: Platform.COVER,
+    FanInfo: Platform.FAN,
+    LightInfo: Platform.LIGHT,
+    LockInfo: Platform.LOCK,
+    MediaPlayerInfo: Platform.MEDIA_PLAYER,
+    NumberInfo: Platform.NUMBER,
+    SelectInfo: Platform.SELECT,
+    SensorInfo: Platform.SENSOR,
+    SwitchInfo: Platform.SWITCH,
+    TextSensorInfo: Platform.SENSOR,
 }
 
 
@@ -63,7 +72,11 @@ class RuntimeEntryData:
     entry_id: str
     client: APIClient
     store: Store
-    state: dict[str, dict[int, EntityState]] = field(default_factory=dict)
+    state: dict[type[EntityState], dict[int, EntityState]] = field(default_factory=dict)
+    # When the disconnect callback is called, we mark all states
+    # as stale so we will always dispatch a state update when the
+    # device reconnects. This is the same format as state_subscriptions.
+    stale_state: set[tuple[type[EntityState], int]] = field(default_factory=set)
     info: dict[str, dict[int, EntityInfo]] = field(default_factory=dict)
 
     # A second list of EntityInfo objects
@@ -78,17 +91,96 @@ class RuntimeEntryData:
     api_version: APIVersion = field(default_factory=APIVersion)
     cleanup_callbacks: list[Callable[[], None]] = field(default_factory=list)
     disconnect_callbacks: list[Callable[[], None]] = field(default_factory=list)
-    loaded_platforms: set[str] = field(default_factory=set)
+    state_subscriptions: dict[
+        tuple[type[EntityState], int], Callable[[], None]
+    ] = field(default_factory=dict)
+    loaded_platforms: set[Platform] = field(default_factory=set)
     platform_load_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     _storage_contents: dict[str, Any] | None = None
+    ble_connections_free: int = 0
+    ble_connections_limit: int = 0
+    _ble_connection_free_futures: list[asyncio.Future[int]] = field(
+        default_factory=list
+    )
+    assist_pipeline_update_callbacks: list[Callable[[], None]] = field(
+        default_factory=list
+    )
+    assist_pipeline_state: bool = False
+
+    @property
+    def name(self) -> str:
+        """Return the name of the device."""
+        return self.device_info.name if self.device_info else self.entry_id
+
+    @property
+    def friendly_name(self) -> str:
+        """Return the friendly name of the device."""
+        if self.device_info and self.device_info.friendly_name:
+            return self.device_info.friendly_name
+        return self.name
+
+    @property
+    def signal_device_updated(self) -> str:
+        """Return the signal to listen to for core device state update."""
+        return f"esphome_{self.entry_id}_on_device_update"
+
+    @property
+    def signal_static_info_updated(self) -> str:
+        """Return the signal to listen to for updates on static info."""
+        return f"esphome_{self.entry_id}_on_list"
+
+    def signal_component_static_info_updated(self, component_key: str) -> str:
+        """Return the signal to listen to for updates on static info for a specific component_key."""
+        return f"esphome_{self.entry_id}_static_info_updated_{component_key}"
 
     @callback
-    def async_update_entity(
-        self, hass: HomeAssistant, component_key: str, key: int
-    ) -> None:
-        """Schedule the update of an entity."""
-        signal = f"esphome_{self.entry_id}_update_{component_key}_{key}"
-        async_dispatcher_send(hass, signal)
+    def async_update_ble_connection_limits(self, free: int, limit: int) -> None:
+        """Update the BLE connection limits."""
+        _LOGGER.debug(
+            "%s [%s]: BLE connection limits: used=%s free=%s limit=%s",
+            self.name,
+            self.device_info.mac_address if self.device_info else "unknown",
+            limit - free,
+            free,
+            limit,
+        )
+        self.ble_connections_free = free
+        self.ble_connections_limit = limit
+        if not free:
+            return
+        for fut in self._ble_connection_free_futures:
+            # If wait_for_ble_connections_free gets cancelled, it will
+            # leave a future in the list. We need to check if it's done
+            # before setting the result.
+            if not fut.done():
+                fut.set_result(free)
+        self._ble_connection_free_futures.clear()
+
+    async def wait_for_ble_connections_free(self) -> int:
+        """Wait until there are free BLE connections."""
+        if self.ble_connections_free > 0:
+            return self.ble_connections_free
+        fut: asyncio.Future[int] = asyncio.Future()
+        self._ble_connection_free_futures.append(fut)
+        return await fut
+
+    @callback
+    def async_set_assist_pipeline_state(self, state: bool) -> None:
+        """Set the assist pipeline state."""
+        self.assist_pipeline_state = state
+        for update_callback in self.assist_pipeline_update_callbacks:
+            update_callback()
+
+    def async_subscribe_assist_pipeline_update(
+        self, update_callback: Callable[[], None]
+    ) -> Callable[[], None]:
+        """Subscribe to assist pipeline updates."""
+
+        def _unsubscribe() -> None:
+            self.assist_pipeline_update_callbacks.remove(update_callback)
+
+        self.assist_pipeline_update_callbacks.append(update_callback)
+        return _unsubscribe
 
     @callback
     def async_remove_entity(
@@ -99,17 +191,12 @@ class RuntimeEntryData:
         async_dispatcher_send(hass, signal)
 
     async def _ensure_platforms_loaded(
-        self, hass: HomeAssistant, entry: ConfigEntry, platforms: set[str]
+        self, hass: HomeAssistant, entry: ConfigEntry, platforms: set[Platform]
     ) -> None:
         async with self.platform_load_lock:
             needed = platforms - self.loaded_platforms
-            tasks = []
-            for platform in needed:
-                tasks.append(
-                    hass.config_entries.async_forward_entry_setup(entry, platform)
-                )
-            if tasks:
-                await asyncio.wait(tasks)
+            if needed:
+                await hass.config_entries.async_forward_entry_setups(entry, needed)
             self.loaded_platforms |= needed
 
     async def async_update_static_infos(
@@ -118,6 +205,14 @@ class RuntimeEntryData:
         """Distribute an update of static infos to all platforms."""
         # First, load all platforms
         needed_platforms = set()
+
+        if async_get_dashboard(hass):
+            needed_platforms.add(Platform.UPDATE)
+
+        if self.device_info is not None and self.device_info.voice_assistant_version:
+            needed_platforms.add(Platform.BINARY_SENSOR)
+            needed_platforms.add(Platform.SELECT)
+
         for info in infos:
             for info_type, platform in INFO_TYPE_TO_PLATFORM.items():
                 if isinstance(info, info_type):
@@ -126,20 +221,70 @@ class RuntimeEntryData:
         await self._ensure_platforms_loaded(hass, entry, needed_platforms)
 
         # Then send dispatcher event
-        signal = f"esphome_{self.entry_id}_on_list"
-        async_dispatcher_send(hass, signal, infos)
+        async_dispatcher_send(hass, self.signal_static_info_updated, infos)
 
     @callback
-    def async_update_state(self, hass: HomeAssistant, state: EntityState) -> None:
-        """Distribute an update of state information to all platforms."""
-        signal = f"esphome_{self.entry_id}_on_state"
-        async_dispatcher_send(hass, signal, state)
+    def async_subscribe_state_update(
+        self,
+        state_type: type[EntityState],
+        state_key: int,
+        entity_callback: Callable[[], None],
+    ) -> Callable[[], None]:
+        """Subscribe to state updates."""
+
+        def _unsubscribe() -> None:
+            self.state_subscriptions.pop((state_type, state_key))
+
+        self.state_subscriptions[(state_type, state_key)] = entity_callback
+        return _unsubscribe
+
+    @callback
+    def async_update_state(self, state: EntityState) -> None:
+        """Distribute an update of state information to the target."""
+        key = state.key
+        state_type = type(state)
+        stale_state = self.stale_state
+        current_state_by_type = self.state[state_type]
+        current_state = current_state_by_type.get(key, _SENTINEL)
+        subscription_key = (state_type, key)
+        if (
+            current_state == state
+            and subscription_key not in stale_state
+            and not (
+                type(state) is SensorState  # pylint: disable=unidiomatic-typecheck
+                and (platform_info := self.info.get(Platform.SENSOR))
+                and (entity_info := platform_info.get(state.key))
+                and (cast(SensorInfo, entity_info)).force_update
+            )
+        ):
+            _LOGGER.debug(
+                "%s: ignoring duplicate update with key %s: %s",
+                self.name,
+                key,
+                state,
+            )
+            return
+        _LOGGER.debug(
+            "%s: dispatching update with key %s: %s",
+            self.name,
+            key,
+            state,
+        )
+        stale_state.discard(subscription_key)
+        current_state_by_type[key] = state
+        if subscription := self.state_subscriptions.get(subscription_key):
+            try:
+                subscription()
+            except Exception as ex:  # pylint: disable=broad-except
+                # If we allow this exception to raise it will
+                # make it all the way to data_received in aioesphomeapi
+                # which will cause the connection to be closed.
+                _LOGGER.exception("Error while calling subscription: %s", ex)
 
     @callback
     def async_update_device_state(self, hass: HomeAssistant) -> None:
         """Distribute an update of a core device state like availability."""
-        signal = f"esphome_{self.entry_id}_on_device_update"
-        async_dispatcher_send(hass, signal)
+        async_dispatcher_send(hass, self.signal_device_updated)
 
     async def async_load_from_store(self) -> tuple[list[EntityInfo], list[UserService]]:
         """Load the retained data from store and return de-serialized data."""

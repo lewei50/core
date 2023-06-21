@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import asynccontextmanager, suppress
 from contextvars import ContextVar
 from copy import copy
@@ -11,7 +11,7 @@ from functools import partial
 import itertools
 import logging
 from types import MappingProxyType
-from typing import Any, TypedDict, Union, cast
+from typing import Any, TypedDict, TypeVar, cast
 
 import async_timeout
 import voluptuous as vol
@@ -46,9 +46,12 @@ from homeassistant.const import (
     CONF_MODE,
     CONF_PARALLEL,
     CONF_REPEAT,
+    CONF_RESPONSE_VARIABLE,
     CONF_SCENE,
     CONF_SEQUENCE,
     CONF_SERVICE,
+    CONF_SERVICE_DATA,
+    CONF_SERVICE_DATA_TEMPLATE,
     CONF_STOP,
     CONF_TARGET,
     CONF_THEN,
@@ -62,8 +65,8 @@ from homeassistant.const import (
     SERVICE_TURN_ON,
 )
 from homeassistant.core import (
-    SERVICE_CALL_LIMIT,
     Context,
+    Event,
     HassJob,
     HomeAssistant,
     callback,
@@ -96,6 +99,8 @@ from .trigger import async_initialize_triggers, async_validate_trigger_config
 from .typing import ConfigType
 
 # mypy: allow-untyped-calls, allow-untyped-defs, no-check-untyped-defs
+
+_T = TypeVar("_T")
 
 SCRIPT_MODE_PARALLEL = "parallel"
 SCRIPT_MODE_QUEUED = "queued"
@@ -218,7 +223,9 @@ async def trace_action(hass, script_run, stop, variables):
         trace_stack_pop(trace_stack_cv)
 
 
-def make_script_schema(schema, default_script_mode, extra=vol.PREVENT_EXTRA):
+def make_script_schema(
+    schema: Mapping[Any, Any], default_script_mode: str, extra: int = vol.PREVENT_EXTRA
+) -> vol.Schema:
     """Make a schema for a component that uses the script helper."""
     return vol.Schema(
         {
@@ -371,7 +378,7 @@ class _ScriptRun:
             self._script._changed()  # pylint: disable=protected-access
 
     async def _async_get_condition(self, config):
-        # pylint: disable=protected-access
+        # pylint: disable-next=protected-access
         return await self._script._async_get_condition(config)
 
     def _log(
@@ -613,7 +620,7 @@ class _ScriptRun:
                 task.cancel()
             unsub()
 
-    async def _async_run_long_action(self, long_task: asyncio.Task) -> None:
+    async def _async_run_long_action(self, long_task: asyncio.Task[_T]) -> _T | None:
         """Run a long task while monitoring for stop request."""
 
         async def async_cancel_long_task() -> None:
@@ -641,10 +648,10 @@ class _ScriptRun:
             raise asyncio.CancelledError
         if long_task.done():
             # Propagate any exceptions that occurred.
-            long_task.result()
-        else:
-            # Stopped before long task completed, so cancel it.
-            await async_cancel_long_task()
+            return long_task.result()
+        # Stopped before long task completed, so cancel it.
+        await async_cancel_long_task()
+        return None
 
     async def _async_call_service_step(self):
         """Call the service specified in the action."""
@@ -659,28 +666,20 @@ class _ScriptRun:
             and params[CONF_SERVICE] == "trigger"
             or params[CONF_DOMAIN] in ("python_script", "script")
         )
-        # If this might start a script then disable the call timeout.
-        # Otherwise use the normal service call limit.
-        if running_script:
-            limit = None
-        else:
-            limit = SERVICE_CALL_LIMIT
-
-        trace_set_result(params=params, running_script=running_script, limit=limit)
-        service_task = self._hass.async_create_task(
-            self._hass.services.async_call(
-                **params,
-                blocking=True,
-                context=self._context,
-                limit=limit,
-            )
+        response_variable = self._action.get(CONF_RESPONSE_VARIABLE)
+        trace_set_result(params=params, running_script=running_script)
+        response_data = await self._async_run_long_action(
+            self._hass.async_create_task(
+                self._hass.services.async_call(
+                    **params,
+                    blocking=True,
+                    context=self._context,
+                    return_response=(response_variable is not None),
+                )
+            ),
         )
-        if limit is not None:
-            # There is a call limit, so just wait for it to finish.
-            await service_task
-            return
-
-        await self._async_run_long_action(service_task)
+        if response_variable:
+            self._variables[response_variable] = response_data
 
     async def _async_device_step(self):
         """Perform the device automation specified in the action."""
@@ -753,7 +752,7 @@ class _ScriptRun:
                 with trace_path(condition_path):
                     for idx, cond in enumerate(conditions):
                         with trace_path(str(idx)):
-                            if not cond(hass, variables):
+                            if cond(hass, variables) is False:
                                 return False
             except exceptions.ConditionError as ex:
                 _LOGGER.warning("Error in '%s[%s]' evaluation: %s", name, idx, ex)
@@ -782,7 +781,7 @@ class _ScriptRun:
                 repeat_vars["item"] = item
             self._variables["repeat"] = repeat_vars
 
-        # pylint: disable=protected-access
+        # pylint: disable-next=protected-access
         script = self._script._get_repeat_script(self._step)
 
         async def async_run_sequence(iteration, extra_msg=""):
@@ -1070,7 +1069,17 @@ class _QueuedScriptRun(_ScriptRun):
         super()._finish()
 
 
-async def _async_stop_scripts_after_shutdown(hass, point_in_time):
+@callback
+def _schedule_stop_scripts_after_shutdown(hass: HomeAssistant) -> None:
+    """Stop running Script objects started after shutdown."""
+    async_call_later(
+        hass, _SHUTDOWN_MAX_WAIT, partial(_async_stop_scripts_after_shutdown, hass)
+    )
+
+
+async def _async_stop_scripts_after_shutdown(
+    hass: HomeAssistant, point_in_time: datetime
+) -> None:
     """Stop running Script objects started after shutdown."""
     hass.data[DATA_NEW_SCRIPT_RUNS_NOT_ALLOWED] = None
     running_scripts = [
@@ -1087,11 +1096,9 @@ async def _async_stop_scripts_after_shutdown(hass, point_in_time):
         )
 
 
-async def _async_stop_scripts_at_shutdown(hass, event):
+async def _async_stop_scripts_at_shutdown(hass: HomeAssistant, event: Event) -> None:
     """Stop running Script objects started before shutdown."""
-    async_call_later(
-        hass, _SHUTDOWN_MAX_WAIT, partial(_async_stop_scripts_after_shutdown, hass)
-    )
+    _schedule_stop_scripts_after_shutdown(hass)
 
     running_scripts = [
         script
@@ -1106,12 +1113,13 @@ async def _async_stop_scripts_at_shutdown(hass, event):
         )
 
 
-_VarsType = Union[dict[str, Any], MappingProxyType]
+_VarsType = dict[str, Any] | MappingProxyType
 
 
-def _referenced_extract_ids(data: dict[str, Any], key: str, found: set[str]) -> None:
+def _referenced_extract_ids(data: Any, key: str, found: set[str]) -> None:
     """Extract referenced IDs."""
-    if not data:
+    # Data may not exist, or be a template
+    if not isinstance(data, dict):
         return
 
     item_ids = data.get(key)
@@ -1275,25 +1283,27 @@ class Script:
         return self.script_mode in (SCRIPT_MODE_PARALLEL, SCRIPT_MODE_QUEUED)
 
     @property
-    def referenced_areas(self):
+    def referenced_areas(self) -> set[str]:
         """Return a set of referenced areas."""
         if self._referenced_areas is not None:
             return self._referenced_areas
 
-        self._referenced_areas: set[str] = set()
+        self._referenced_areas = set()
         Script._find_referenced_areas(self._referenced_areas, self.sequence)
         return self._referenced_areas
 
     @staticmethod
-    def _find_referenced_areas(referenced, sequence):
+    def _find_referenced_areas(
+        referenced: set[str], sequence: Sequence[dict[str, Any]]
+    ) -> None:
         for step in sequence:
             action = cv.determine_script_action(step)
 
             if action == cv.SCRIPT_ACTION_CALL_SERVICE:
                 for data in (
                     step.get(CONF_TARGET),
-                    step.get(service.CONF_SERVICE_DATA),
-                    step.get(service.CONF_SERVICE_DATA_TEMPLATE),
+                    step.get(CONF_SERVICE_DATA),
+                    step.get(CONF_SERVICE_DATA_TEMPLATE),
                 ):
                     _referenced_extract_ids(data, ATTR_AREA_ID, referenced)
 
@@ -1313,25 +1323,27 @@ class Script:
                     Script._find_referenced_areas(referenced, script[CONF_SEQUENCE])
 
     @property
-    def referenced_devices(self):
+    def referenced_devices(self) -> set[str]:
         """Return a set of referenced devices."""
         if self._referenced_devices is not None:
             return self._referenced_devices
 
-        self._referenced_devices: set[str] = set()
+        self._referenced_devices = set()
         Script._find_referenced_devices(self._referenced_devices, self.sequence)
         return self._referenced_devices
 
     @staticmethod
-    def _find_referenced_devices(referenced, sequence):
+    def _find_referenced_devices(
+        referenced: set[str], sequence: Sequence[dict[str, Any]]
+    ) -> None:
         for step in sequence:
             action = cv.determine_script_action(step)
 
             if action == cv.SCRIPT_ACTION_CALL_SERVICE:
                 for data in (
                     step.get(CONF_TARGET),
-                    step.get(service.CONF_SERVICE_DATA),
-                    step.get(service.CONF_SERVICE_DATA_TEMPLATE),
+                    step.get(CONF_SERVICE_DATA),
+                    step.get(CONF_SERVICE_DATA_TEMPLATE),
                 ):
                     _referenced_extract_ids(data, ATTR_DEVICE_ID, referenced)
 
@@ -1361,17 +1373,19 @@ class Script:
                     Script._find_referenced_devices(referenced, script[CONF_SEQUENCE])
 
     @property
-    def referenced_entities(self):
+    def referenced_entities(self) -> set[str]:
         """Return a set of referenced entities."""
         if self._referenced_entities is not None:
             return self._referenced_entities
 
-        self._referenced_entities: set[str] = set()
+        self._referenced_entities = set()
         Script._find_referenced_entities(self._referenced_entities, self.sequence)
         return self._referenced_entities
 
     @staticmethod
-    def _find_referenced_entities(referenced, sequence):
+    def _find_referenced_entities(
+        referenced: set[str], sequence: Sequence[dict[str, Any]]
+    ) -> None:
         for step in sequence:
             action = cv.determine_script_action(step)
 
@@ -1379,8 +1393,8 @@ class Script:
                 for data in (
                     step,
                     step.get(CONF_TARGET),
-                    step.get(service.CONF_SERVICE_DATA),
-                    step.get(service.CONF_SERVICE_DATA_TEMPLATE),
+                    step.get(CONF_SERVICE_DATA),
+                    step.get(CONF_SERVICE_DATA_TEMPLATE),
                 ):
                     _referenced_extract_ids(data, ATTR_ENTITY_ID, referenced)
 
@@ -1527,7 +1541,7 @@ class Script:
         self, update_state: bool = True, spare: _ScriptRun | None = None
     ) -> None:
         """Stop running script."""
-        # Collect a a list of script runs to stop. This must be done before calling
+        # Collect a list of script runs to stop. This must be done before calling
         # asyncio.shield as asyncio.shield yields to the event loop, which would cause
         # us to wait for script runs added after the call to async_stop.
         aws = [

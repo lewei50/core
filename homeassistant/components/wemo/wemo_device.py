@@ -9,6 +9,8 @@ from pywemo.subscribe import EVENT_TYPE_LONG_PRESS
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import (
+    ATTR_CONFIGURATION_URL,
+    ATTR_IDENTIFIERS,
     CONF_DEVICE_ID,
     CONF_NAME,
     CONF_PARAMS,
@@ -28,7 +30,7 @@ from .const import DOMAIN, WEMO_SUBSCRIPTION_EVENT
 _LOGGER = logging.getLogger(__name__)
 
 
-class DeviceCoordinator(DataUpdateCoordinator):
+class DeviceCoordinator(DataUpdateCoordinator[None]):
     """Home Assistant wrapper for a pyWeMo device."""
 
     def __init__(self, hass: HomeAssistant, wemo: WeMoDevice, device_id: str) -> None:
@@ -42,7 +44,7 @@ class DeviceCoordinator(DataUpdateCoordinator):
         self.hass = hass
         self.wemo = wemo
         self.device_id = device_id
-        self.device_info = _device_info(wemo)
+        self.device_info = _create_device_info(wemo)
         self.supports_long_press = wemo.supports_long_press()
         self.update_lock = asyncio.Lock()
 
@@ -59,7 +61,7 @@ class DeviceCoordinator(DataUpdateCoordinator):
                     CONF_NAME: self.wemo.name,
                     CONF_TYPE: event_type,
                     CONF_PARAMS: params,
-                    CONF_UNIQUE_ID: self.wemo.serialnumber,
+                    CONF_UNIQUE_ID: self.wemo.serial_number,
                 },
             )
         else:
@@ -124,10 +126,19 @@ class DeviceCoordinator(DataUpdateCoordinator):
                 raise UpdateFailed("WeMo update failed") from err
 
 
+def _create_device_info(wemo: WeMoDevice) -> DeviceInfo:
+    """Create device information. Modify if special device."""
+    _dev_info = _device_info(wemo)
+    if wemo.model_name == "DLI emulated Belkin Socket":
+        _dev_info[ATTR_CONFIGURATION_URL] = f"http://{wemo.host}"
+        _dev_info[ATTR_IDENTIFIERS] = {(DOMAIN, wemo.serial_number[:-1])}
+    return _dev_info
+
+
 def _device_info(wemo: WeMoDevice) -> DeviceInfo:
     return DeviceInfo(
         connections={(CONNECTION_UPNP, wemo.udn)},
-        identifiers={(DOMAIN, wemo.serialnumber)},
+        identifiers={(DOMAIN, wemo.serial_number)},
         manufacturer="Belkin",
         model=wemo.model_name,
         name=wemo.name,
@@ -144,7 +155,7 @@ async def async_register_device(
 
     device_registry = async_get_device_registry(hass)
     entry = device_registry.async_get_or_create(
-        config_entry_id=config_entry.entry_id, **_device_info(wemo)
+        config_entry_id=config_entry.entry_id, **_create_device_info(wemo)
     )
 
     device = DeviceCoordinator(hass, wemo, entry.id)

@@ -23,7 +23,7 @@ import voluptuous as vol
 
 from homeassistant.auth.permissions.const import POLICY_READ
 from homeassistant.components.camera import Image, img_util
-from homeassistant.components.http.const import KEY_HASS_USER
+from homeassistant.components.http import KEY_HASS_USER
 from homeassistant.components.http.view import HomeAssistantView
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import (
@@ -54,6 +54,7 @@ from . import api, config_flow
 from .const import (
     CONF_PROJECT_ID,
     CONF_SUBSCRIBER_ID,
+    CONF_SUBSCRIBER_ID_IMPORTED,
     DATA_DEVICE_MANAGER,
     DATA_NEST_CONFIG,
     DATA_SDM,
@@ -70,9 +71,6 @@ from .media_source import (
 
 _LOGGER = logging.getLogger(__name__)
 
-DATA_NEST_UNAVAILABLE = "nest_unavailable"
-
-NEST_SETUP_NOTIFICATION = "nest_setup"
 
 SENSOR_SCHEMA = vol.Schema(
     {vol.Optional(CONF_MONITORED_CONDITIONS): vol.All(cv.ensure_list)}
@@ -112,19 +110,18 @@ THUMBNAIL_SIZE_PX = 175
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     """Set up Nest components with dispatch between old/new flows."""
     hass.data[DOMAIN] = {}
-    hass.data[DOMAIN][DATA_NEST_CONFIG] = config.get(DOMAIN)
+
+    hass.http.register_view(NestEventMediaView(hass))
+    hass.http.register_view(NestEventMediaThumbnailView(hass))
 
     if DOMAIN not in config:
-        return True
+        return True  # ConfigMode.SDM_APPLICATION_CREDENTIALS
+
+    hass.data[DOMAIN][DATA_NEST_CONFIG] = config[DOMAIN]
 
     config_mode = config_flow.get_config_mode(hass)
     if config_mode == config_flow.ConfigMode.LEGACY:
         return await async_setup_legacy(hass, config)
-
-    config_flow.register_flow_implementation_from_config(hass, config)
-
-    hass.http.register_view(NestEventMediaView(hass))
-    hass.http.register_view(NestEventMediaThumbnailView(hass))
 
     return True
 
@@ -170,9 +167,14 @@ class SignalUpdateCallback:
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up Nest from a config entry with dispatch between old/new flows."""
-
-    if DATA_SDM not in entry.data:
+    config_mode = config_flow.get_config_mode(hass)
+    if DATA_SDM not in entry.data or config_mode == config_flow.ConfigMode.LEGACY:
         return await async_setup_legacy_entry(hass, entry)
+
+    if entry.unique_id != entry.data[CONF_PROJECT_ID]:
+        hass.config_entries.async_update_entry(
+            entry, unique_id=entry.data[CONF_PROJECT_ID]
+        )
 
     subscriber = await api.new_subscriber(hass, entry)
     if not subscriber:
@@ -192,33 +194,29 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     try:
         await subscriber.start_async()
     except AuthException as err:
-        _LOGGER.debug("Subscriber authentication error: %s", err)
-        raise ConfigEntryAuthFailed from err
+        raise ConfigEntryAuthFailed(
+            f"Subscriber authentication error: {str(err)}"
+        ) from err
     except ConfigurationException as err:
         _LOGGER.error("Configuration error: %s", err)
         subscriber.stop_async()
         return False
     except SubscriberException as err:
-        if DATA_NEST_UNAVAILABLE not in hass.data[DOMAIN]:
-            _LOGGER.error("Subscriber error: %s", err)
-            hass.data[DOMAIN][DATA_NEST_UNAVAILABLE] = True
         subscriber.stop_async()
-        raise ConfigEntryNotReady from err
+        raise ConfigEntryNotReady(f"Subscriber error: {str(err)}") from err
 
     try:
         device_manager = await subscriber.async_get_device_manager()
     except ApiException as err:
-        if DATA_NEST_UNAVAILABLE not in hass.data[DOMAIN]:
-            _LOGGER.error("Device manager error: %s", err)
-            hass.data[DOMAIN][DATA_NEST_UNAVAILABLE] = True
         subscriber.stop_async()
-        raise ConfigEntryNotReady from err
+        raise ConfigEntryNotReady(f"Device manager error: {str(err)}") from err
 
-    hass.data[DOMAIN].pop(DATA_NEST_UNAVAILABLE, None)
-    hass.data[DOMAIN][DATA_SUBSCRIBER] = subscriber
-    hass.data[DOMAIN][DATA_DEVICE_MANAGER] = device_manager
+    hass.data[DOMAIN][entry.entry_id] = {
+        DATA_SUBSCRIBER: subscriber,
+        DATA_DEVICE_MANAGER: device_manager,
+    }
 
-    hass.config_entries.async_setup_platforms(entry, PLATFORMS)
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
     return True
 
@@ -229,20 +227,22 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         # Legacy API
         return True
     _LOGGER.debug("Stopping nest subscriber")
-    subscriber = hass.data[DOMAIN][DATA_SUBSCRIBER]
+    subscriber = hass.data[DOMAIN][entry.entry_id][DATA_SUBSCRIBER]
     subscriber.stop_async()
     unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     if unload_ok:
-        hass.data[DOMAIN].pop(DATA_SUBSCRIBER)
-        hass.data[DOMAIN].pop(DATA_DEVICE_MANAGER)
-        hass.data[DOMAIN].pop(DATA_NEST_UNAVAILABLE, None)
+        hass.data[DOMAIN].pop(entry.entry_id)
 
     return unload_ok
 
 
 async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
     """Handle removal of pubsub subscriptions created during config flow."""
-    if DATA_SDM not in entry.data or CONF_SUBSCRIBER_ID not in entry.data:
+    if (
+        DATA_SDM not in entry.data
+        or CONF_SUBSCRIBER_ID not in entry.data
+        or CONF_SUBSCRIBER_ID_IMPORTED in entry.data
+    ):
         return
 
     subscriber = await api.new_subscriber(hass, entry)
@@ -253,7 +253,10 @@ async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
         await subscriber.delete_subscription()
     except (AuthException, SubscriberException) as err:
         _LOGGER.warning(
-            "Unable to delete subscription '%s'; Will be automatically cleaned up by cloud console: %s",
+            (
+                "Unable to delete subscription '%s'; Will be automatically cleaned up"
+                " by cloud console: %s"
+            ),
             subscriber.subscriber_id,
             err,
         )

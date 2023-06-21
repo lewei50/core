@@ -72,7 +72,7 @@ class MotionEyeConfigFlow(ConfigFlow, domain=DOMAIN):
                         ): str,
                         vol.Optional(
                             CONF_ADMIN_PASSWORD,
-                            default=user_input.get(CONF_ADMIN_PASSWORD),
+                            default=user_input.get(CONF_ADMIN_PASSWORD, ""),
                         ): str,
                         vol.Optional(
                             CONF_SURVEILLANCE_USERNAME,
@@ -80,7 +80,7 @@ class MotionEyeConfigFlow(ConfigFlow, domain=DOMAIN):
                         ): str,
                         vol.Optional(
                             CONF_SURVEILLANCE_PASSWORD,
-                            default=user_input.get(CONF_SURVEILLANCE_PASSWORD),
+                            default=user_input.get(CONF_SURVEILLANCE_PASSWORD, ""),
                         ): str,
                     }
                 ),
@@ -157,10 +157,7 @@ class MotionEyeConfigFlow(ConfigFlow, domain=DOMAIN):
             data=user_input,
         )
 
-    async def async_step_reauth(
-        self,
-        config_data: Mapping[str, Any],
-    ) -> FlowResult:
+    async def async_step_reauth(self, entry_data: Mapping[str, Any]) -> FlowResult:
         """Handle a reauthentication flow."""
         return await self.async_step_user()
 
